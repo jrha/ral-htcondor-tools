@@ -1,0 +1,475 @@
+#!/bin/bash
+#
+# This script takes over most of the nagios checks and actions.
+# There can be soft errors or hard errors, with appropriate actions
+#
+# Note to explain healhcheck script with per VO disabling.
+# If we want to disable jobs starts on a per VO basis the script needs to return something like:
+# NODE_IS_HEALTHY = True && (regexp("atl", Owner) =!= False) && (regexp("cms", Owner) =!= False)
+
+# Variable Declarations
+DATE=$(date)
+PROGRAM=`basename $0`
+SHOSTNAME=$(hostname -s)
+NAGIOS_SERVER="130.246.180.225" # Nagios server obviously
+CONDOR_MESG="NODE_IS_HEALTHY = True" # Message to Condor, default OK
+CONDOR_MESG_GATEWAY="True"
+CONDOR_MESG_GATEWAY_STATUS="Healthy"
+CONDOR_MESG_PROXY="True"
+CONDOR_MESG_PROXY_STATUS="Healthy"
+NAGIOS_MESG="All_OK" # Message to nagios, default OK
+LOGGER="/usr/bin/env logger" # logger program
+LOG_MESG="Failed healthcheck:" # log message preamble, to be extended in script
+TEST_MESG="" # What the test says.
+TIME_SERVER="time.rl.ac.uk" # The RAL time server
+TEST_FILE="/pool/condor/andrewIsGreat" # A test file name
+CG_ENABLED="" # Variable used to check cgroups - its a string
+typeset -i RC=0 # Return code from other scripts / progs
+typeset -i DEBUG_VAL=0 # Are we debugging
+typeset -i EXIT_CODE=0 # Exit code for script and nagios
+typeset -i VIRTUAL_WORKER=0 # Is the node a virtual node
+typeset -i UPTIME_TEST_VAL=10 # minimum uptime for machine
+typeset -i UPTIME_VAL=10 # actual uptime for machine
+typeset -i VIRTUAL_WORKER=0 # Is this a VM
+declare -a FILE_SYSTEMS # Array to hold list of filesystems
+declare -a DEAD_REPO_USERS # Array to hold list of dead repo users
+# we need a hash to map VOs to regex -  Only declare it once
+declare -A VOS
+VOS["atlas.cern.ch"]=atl
+VOS["atlas-condb.cern.ch"]=atl
+VOS["cms.cern.ch"]=cms
+VOS["lhcb.cern.ch"]=lhcb
+VOS["alice.cern.ch"]=alice
+# End Variable Declarations
+
+# House keeping
+# first check for debug on command line. It is useful to be able to run this in debug mode
+case "$1" in
+    -d|--debug)
+        DEBUG_VAL=1
+        shift
+        ;;
+esac
+
+function debug() {
+    if [ $DEBUG_VAL -gt 0 ]
+    then
+        echo "DEBUG: $@"
+    fi
+}
+
+# We only want debug - nothing else.
+if [ $# -gt 0 ]
+then
+    echo ""
+    echo "Wrong input for $PROGRAM, -d is the only option"
+    exit 3
+fi
+# End of housekeeping
+
+# Start of functions
+function fatal_exit() {
+ # function to deal with a fatal test failure
+    NAGIOS_MESG=$@
+    CONDOR_MESG="NODE_IS_HEALTHY = False" # Message for condor
+    EXIT_CODE=2
+    echo $CONDOR_MESG # standard out to condor
+    echo "NODE_STATUS = \"$NAGIOS_MESG\""
+    LOG_MESG="$LOG_MESG  ${NAGIOS_MESG}" # log message
+    if [ $DEBUG_VAL -gt 0 ] # if debug, we want to know what is going on
+    then # And we want to continue wth the other tests
+        echo "EXIT_CODE    ${EXIT_CODE}"
+        echo
+        echo "Normally exit here === Continuing in debug mode ==="
+        echo
+        return # We want to do all the tests in debug mode, so return for more
+    else # no debug, so send nsca and write log message and exit
+        /bin/echo -e "${SHOSTNAME}\tCondor Health check\t${EXIT_CODE}\t${NAGIOS_MESG}"| /usr/sbin/send_nsca -H ${NAGIOS_SERVER} -c /etc/nagios/send_nsca.cfg >/dev/null
+        if [  -n "$LOG_MESG" ] # log what we do the syslog.
+        then
+            $LOGGER $LOG_MESG
+        fi
+        exit ${EXIT_CODE}
+    fi
+}
+# End of functions.
+
+# Start work
+debug "starting ${PROGRAM} on ${DATE}"
+
+# Check if we are on a vm
+if ( grep -q workernode-virtual /etc/motd )
+then
+    VIRTUAL_WORKER=1 # Is the node a virtual node?
+    UPTIME_TEST_VAL=2
+else
+    VIRTUAL_WORKER=0
+    UPTIME_TEST_VAL=10
+fi
+debug "VIRTUAL_WORKER is $VIRTUAL_WORKER"
+debug "\$UPTIME_TEST_VAL is $UPTIME_TEST_VAL"
+# End of vm Checks
+
+# Start of checks - Fatal checks first.
+# The first check to fire ends the script except in debug mode.
+
+# Uptime check
+debug "Testing uptime is > $UPTIME_TEST_VAL mins"
+if [ $DEBUG_VAL -gt 0 ]
+then
+    uptime  | awk '{print "Machine up: " $3 " " $4}'
+fi
+
+UPTIME_VAL=$(uptime | awk '{if (match($4, "min")) print $3 ; else print "100"}')
+if [ $UPTIME_VAL -le $UPTIME_TEST_VAL ]
+then
+        fatal_exit "Problem: Machine up less than $UPTIME_TEST_VAL minutes."
+fi
+# end of uptime check
+
+# Test for file /etc/condor/pool_password
+debug "Checking /etc/condor/pool_password"
+if [ ! -s /etc/condor/pool_password ]
+then
+    fatal_exit "No or zero sized pool_password file found"
+fi
+# End of pool_password check
+
+# test for time
+debug "Testing system time against ${TIME_SERVER}"
+# check the nagios plugin test exists
+if [ ! -f /usr/lib64/nagios/plugins/check_ntp_time ]
+then
+    fatal_exit "Problem: No check time script available"
+fi
+if [ $DEBUG_VAL -gt 0 ]
+then
+    /usr/lib64/nagios/plugins/check_ntp_time -c 1 -H ${TIME_SERVER}
+    RC=$?
+else
+    /usr/lib64/nagios/plugins/check_ntp_time -c 1 -H ${TIME_SERVER} >/dev/null 2>&1
+    RC=$?
+fi
+
+if [ $RC -gt 0 ]
+then
+    fatal_exit "Problem: machine clock more than 1 second out"
+fi
+# end of time check.
+
+# Check if /pool is a mountpoint
+debug "Checking if /pool is a mountpoint"
+mountpoint /pool > /dev/null 2>&1
+RC=$?
+if [ $RC -gt 0 ]
+then
+    fatal_exit "Problem: /pool is not a mountpoint"
+fi
+# end of mountpoint check
+
+# Check if xfs_info is installed
+debug "Checking if xfs_info is installed"
+if [ ! -f /usr/sbin/xfs_info ]; then
+    fatal_exit "Problem: xfs_info is not installed"
+fi
+# end of xfs_info check
+
+# Check if /pool is formatted correctly
+debug "Checking if /pool is formatted correctly"
+xfs_info /pool | grep ftype=1 > /dev/null 2>&1
+RC=$?
+if [ $RC -gt 0 ]
+then
+    fatal_exit "Problem: /pool is not on a properly formatted XFS filesystem"
+fi
+# end check if /pool is formatted correctly
+
+# Read-only filesystem check. Cant run the whole thing cos we would need root.
+# But we can check the condor directory.
+debug "Testing for writable /pool/condor"
+if [ ! -d /pool/condor ] # no condor dir
+then
+    fatal_exit "Problem: No condor scratch area"
+fi
+
+trap "rm -f $TEST_FILE; exit" INT TERM EXIT
+touch ${TEST_FILE} 1> /dev/null 2>&1
+RC=$?
+rm -f ${TEST_FILE} > /dev/null 2>&1
+trap - INT TERM EXIT
+
+if [ $RC -gt 0 ]
+then
+    fatal_exit "Problem: Condor cant write to condor scratch area"
+else
+    debug "OK condor scratch area is writable"
+fi
+# end of read-only filesystem check
+
+# check swap but not on vitual machines
+if [[ $VIRTUAL_WORKER -ne 1 ]]
+then
+ # This test depends on the nagios check_swap script being available, so check first
+    if [ ! -f /usr/lib64/nagios/plugins/check_swap ]
+    then
+        fatal_exit "Problem: No nagios check swap script available"
+    fi
+    debug "Testing swap free"
+    if [ $DEBUG_VAL -gt 0 ]
+    then
+        /usr/lib64/nagios/plugins/check_swap -w 25% -c 20%
+        RC=$?
+    else
+        /usr/lib64/nagios/plugins/check_swap -w 25% -c 20% >/dev/null 2>&1
+        RC=$?
+    fi
+    if [ $RC -gt 0 ]
+    then
+        fatal_exit "Problem: Swap in use, less than 25% free"
+    fi
+fi
+# End of check swap.
+
+# Specifically check for grid.cern.ch as it is now supplying our middle ware
+debug "Checking  CVMFS grid.cern.ch"
+# This test depends  on the nagios check_cvmfs script being available,
+# so check first
+if [ ! -f /usr/lib/nagios/plugins/tier1/check_cvmfs2.sh ]
+then
+    debug "script, /usr/lib64/nagios/plugins/check_disk not available"
+    fatal_exit "Problem: No check cvmfs script available"
+fi
+if [ $DEBUG_VAL -gt 0 ]
+then
+    /usr/lib/nagios/plugins/tier1/check_cvmfs2.sh grid.cern.ch
+    RC=$?
+else
+    /usr/lib/nagios/plugins/tier1/check_cvmfs2.sh grid.cern.ch  >/dev/null 2>&1
+    RC=$?
+fi
+
+if [ $RC -gt 0 ]
+then
+    fatal_exit "Problem: CVMFS for grid.cern.ch failed"
+fi
+# End of check for grid.cern.ch
+
+
+# check disk pool
+# This test  and the next one depends on the nagios check_disk script being available,
+# so check first
+if [ ! -f /usr/lib64/nagios/plugins/check_disk ]
+then
+    debug "script, /usr/lib64/nagios/plugins/check_disk not available"
+    fatal_exit "Problem: No check disk script available"
+fi
+
+debug "Testing space on /pool"
+if [ $DEBUG_VAL -gt 0 ]
+then
+    /usr/lib64/nagios/plugins/check_disk  -c 5000 -p /pool
+    RC=$?
+else
+    /usr/lib64/nagios/plugins/check_disk  -c 5000 -p /pool >/dev/null 2>&1
+    RC=$?
+fi
+if [ $RC -gt 0 ]
+then
+    fatal_exit "Problem: less than 5000Mb free on /pool"
+fi
+# End of check on /pool
+
+# Check all other filesystems have at least 5% free.
+# Note that this purposely does not check cvmfs or rather fuse
+# And there is an exception for /etc/nubes-context
+
+FILE_SYSTEMS=`df -lh -x fuse | sed -ne '/^\/dev/s/^.*\% \([^ ]*\)$/\1/p'`
+debug "Testing local filesystems for min 5% free space"
+for dir in ${FILE_SYSTEMS[@]}
+do
+ # We want to skip nubes-context cos it is always 100%
+    if [ $dir == "/etc/nubes-context" ]
+    then
+        debug "Skipping $dir because we dont want it"
+        continue
+    fi
+
+    if [ $DEBUG_VAL -gt 0 ]
+    then
+        /usr/lib64/nagios/plugins/check_disk  -c 5% -p $dir
+        RC=$?
+    else
+        /usr/lib64/nagios/plugins/check_disk  -c 5% -p $dir >/dev/null 2>&1
+        RC=$?
+    fi
+
+    if [ $RC -gt 0 ]
+    then
+        debug "less than 5% free on $dir"
+        TEST_MESG="${TEST_MESG} Problem: less than 5% free on $dir "
+    fi
+done
+
+if [ ! -z "$TEST_MESG" ]
+then
+    fatal_ext $TEST_MESG
+fi
+# End of filesystems check
+
+# Check cgroups on worker nodes that don't have Docker installed
+debug "Testing cgroups"
+if [ ! -f "/usr/bin/docker" ]
+then
+    CG_ENABLED=$(condor_config_val BASE_CGROUP 2>/dev/null)
+    debug "condor_config_val for BASE_CGROUP is: $CG_ENABLED"
+    if [ ! -z $CG_ENABLED ]
+    then
+        RC=0
+        if [ $DEBUG_VAL -gt 0 ]
+        then
+            debug "cgconfig status is: "
+            /sbin/service cgconfig status
+            RC=$?
+        else
+            /sbin/service cgconfig status >/dev/null 2>&1
+            RC=$?
+        fi
+        if [ $RC -gt 0 ]
+        then
+            debug "cgroups configured in condor but cgconfig not running"
+            fatal_exit "Problem: cgconfig not running"
+        fi
+    fi
+fi
+# End Check cgroupgs
+
+# Check if Docker daemon is ok
+
+if [ -f "/usr/bin/docker" ]
+then
+ # A basic check that the Docker daemon is running
+    sudo /usr/bin/docker ps >/dev/null 2>&1
+    RC=$?
+    if [ $RC -ne 0 ]
+    then
+        fatal_exit "Problem: Cannot obtain list of Docker containers"
+    fi
+
+ # Check that containerd is running
+    pidof docker-containerd > /dev/null 2>&1
+    RC=$?
+    if [ $RC -ne 0 ]
+    then
+        fatal_exit "Problem: containerd is not running"
+    fi
+
+ # Check that containers can be created successfully
+    sudo /usr/bin/docker run --rm -m 5m busybox date >/dev/null 2>&1
+    RC=$?
+    if [ $RC -ne 0 ]
+    then
+        fatal_exit "Problem: Unable to run Docker containers"
+    fi
+fi
+
+# End Check docker
+
+# Check if local Echo xrootd gateway is running
+
+if [ -f "/usr/bin/docker" ]
+then
+    { gwstatus=`sudo /usr/bin/docker inspect --format '{{ .State.Health.Status }}' xrootd-gateway`; } 2>/dev/null
+    RC=$?
+    if [ $RC -ne 0 ]; then
+        TEST_MESG="${TEST_MESG} Problem: local xrootd gateway"
+        CONDOR_MESG_GATEWAY="(WantEchoXrootd =?= False || WantEchoXrootd =?= UNDEFINED)"
+        CONDOR_MESG_GATEWAY_STATUS="None"
+    else
+        if [ $gwstatus == "unhealthy" ]; then
+            TEST_MESG="${TEST_MESG} Problem: local xrootd gateway"
+            CONDOR_MESG_GATEWAY="(WantEchoXrootd =?= False || WantEchoXrootd =?= UNDEFINED)"
+            CONDOR_MESG_GATEWAY_STATUS="Unhealthy"
+        fi
+    fi
+fi
+
+# Check if local Echo xrootd proxy is running
+
+if [ -f "/usr/bin/docker" ]
+then
+    { gwstatus=`sudo /usr/bin/docker inspect --format '{{ .State.Health.Status }}' xrootd-proxy`; } 2>/dev/null
+    RC=$?
+    if [ $RC -ne 0 ]; then
+        TEST_MESG="${TEST_MESG} Problem: local xrootd proxy"
+        CONDOR_MESG_PROXY="(WantEchoXrootd =?= False || WantEchoXrootd =?= UNDEFINED)"
+        CONDOR_MESG_PROXY_STATUS="None"
+    else
+        if [ $gwstatus == "unhealthy" ]; then
+            TEST_MESG="${TEST_MESG} Problem: local xrootd proxy"
+            CONDOR_MESG_PROXY="(WantEchoXrootd =?= False || WantEchoXrootd =?= UNDEFINED)"
+            CONDOR_MESG_PROXY_STATUS="Unhealthy"
+        fi
+    fi
+fi
+
+## Non-fatal checks these don't call fatal_exit but simply set NAGIOS_MESG,
+## CONDOR_MESG and EXIT_CODE and exit
+
+# Check CVMFS for selected VOs
+debug "CVMFS check for selected VOs"
+for vo in  "${!VOS[@]}"
+do
+    debug "Checking $vo"
+    if [ $DEBUG_VAL -gt 0 ]
+    then
+        /usr/lib/nagios/plugins/tier1/check_cvmfs2.sh $vo
+        RC=$?
+    else
+        /usr/lib/nagios/plugins/tier1/check_cvmfs2.sh $vo >/dev/null 2>&1
+        RC=$?
+    fi
+
+    if [ $RC -ne 0 ]
+    then
+        TEST_MESG="${TEST_MESG} Problem: CVMFS for $vo"
+        DEAD_REPO_USERS=("${DEAD_REPO_USERS[@]}" "${VOS[$vo]}")
+    fi
+done
+
+# lets see if we got any DEAD_REPO_USERS
+# if more than 2, it is a fatal_exit
+# if only 1 or 2 ,  set CONDOR_MESG, NAGIOS_MESG and EXIT_CODE appropriately
+debug "After checking CVMFS, the number of problem users is ${#DEAD_REPO_USERS[@]}"
+if [ ${#DEAD_REPO_USERS[@]} -gt 2 ]
+then
+    NAGIOS_MESG=$TEST_MESG
+    fatal_exit "More that 2 CVMFS repo broken"
+
+elif [ ${#DEAD_REPO_USERS[@]} -gt 0 ]
+then
+    NAGIOS_MESG=$TEST_MESG
+    for dead in ${DEAD_REPO_USERS[@]}
+    do
+        CONDOR_MESG="$CONDOR_MESG && (regexp(\"$dead\", Owner) =?= False)"
+    done
+    EXIT_CODE=1 # Nagios warn
+fi
+# end of cvmfs checks
+## End of non-fatal checks
+
+# Handle status of local xrootd gateway
+CONDOR_MESG="${CONDOR_MESG} && ${CONDOR_MESG_GATEWAY}"
+
+# Handle status of local xrootd proxy
+CONDOR_MESG="${CONDOR_MESG} && ${CONDOR_MESG_PROXY}"
+
+# Now just do an exit with correct codes..
+debug "NAGIOS_MESG  $NAGIOS_MESG"
+debug "EXIT_CODE    $EXIT_CODE"
+echo $CONDOR_MESG
+echo "NODE_STATUS = \"$NAGIOS_MESG\""
+echo "ECHO_XROOTD_GATEWAY_STATUS = \"$CONDOR_MESG_GATEWAY_STATUS\""
+echo "ECHO_XROOTD_PROXY_STATUS = \"$CONDOR_MESG_PROXY_STATUS\""
+/bin/echo -e "${SHOSTNAME}\tCondor Health check\t${EXIT_CODE}\t${NAGIOS_MESG}" | /usr/sbin/send_nsca -H ${NAGIOS_SERVER} -c /etc/nagios/send_nsca.cfg >/dev/null
+# We don't bother logging non-fatal runs.
+exit ${EXIT_CODE}
